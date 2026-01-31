@@ -1,170 +1,114 @@
-const { chromium } = require('playwright');
-const fs = require('fs');
-const path = require('path');
-const fetch = require('node-fetch');
-const html = require('html-entities').AllHtmlEntities;
+// bot_message.js
+const TelegramBot = require('node-telegram-bot-api');
 const config = require('./config');
 const utils = require('./utils');
 
-class OTPFilter {
-    constructor(file = path.join(__dirname, 'otp_cache.json')) {
-        this.file = file;
-        this.cache = this._load();
-    }
-    _load() {
-        if (fs.existsSync(this.file)) {
-            try { return JSON.parse(fs.readFileSync(this.file, 'utf8')); } 
-            catch { return {}; }
-        }
-        return {};
-    }
-    _save() { fs.writeFileSync(this.file, JSON.stringify(this.cache, null, 2)); }
-    filter(list) {
-        const out = [];
-        for (const d of list) {
-            const key = `${d.otp}_${d.phone}`;
-            if (d.otp && !this.cache[key]) {
-                this.cache[key] = { t: Date.now() };
-                out.push(d);
-            }
-        }
-        this._save();
-        return out;
-    }
-}
-
-const otpFilter = new OTPFilter();
-
-function maskPhone(phone) {
-    if (!phone || phone === 'N/A') return phone;
-    const digits = phone.replace(/\D/g, '');
-    if (digits.length < 7) return phone;
-    const prefix = phone.startsWith('+') ? '+' : '';
-    return `${prefix}${digits.slice(0, 5)}***${digits.slice(-4)}`;
-}
-
-function formatOTPMessage(data) {
-    const userTag = data.username ? `@${data.username}` : 'unknown';
-    const rawMsg = html.encode(data.raw_message || '');
-    return `💭 <b>New Message Received</b>\n\n` +
-           `<b>👤 User:</b> ${userTag}\n` +
-           `<b>📱 Number:</b> <code>${maskPhone(data.phone)}</code>\n` +
-           `<b>🌍 Country:</b> ${data.range || 'N/A'}\n` +
-           `<b>✅ Service:</b> ${data.service}\n\n` +
-           `🔐 OTP: <code>${data.otp}</code>\n\n` +
-           `<b>FULL MESSAGE:</b>\n<blockquote>${rawMsg}</blockquote>`;
-}
-
-function extractOTP(text) {
-    if (!text) return null;
-    const patterns = [
-        /(\d{3}[\s-]\d{3})/, 
-        /(?:code|otp|kode)[:\s]*([\d\s-]+)/i, 
-        /\b(\d{4,8})\b/
-    ];
-    for (const p of patterns) {
-        const m = text.match(p);
-        if (m) return m[1] ? m[1].replace(/\D/g, '') : m[0].replace(/\D/g, '');
-    }
-    return null;
-}
-
-function saveOTPToJSON(data) {
-    const folder = path.join(__dirname, '../get');
-    const file = path.join(folder, 'smc.json');
-    if (!fs.existsSync(folder)) fs.mkdirSync(folder, { recursive: true });
-    const toSave = {
-        service: data.service || 'Unknown',
-        number: data.phone || 'N/A',
-        otp: data.otp || 'N/A',
-        full_message: data.raw_message || ''
-    };
-    let existing = [];
-    if (fs.existsSync(file)) {
-        try { existing = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
-    }
-    existing.push(toSave);
-    fs.writeFileSync(file, JSON.stringify(existing, null, 2));
-}
-
-function createInlineKeyboard(otp) {
-    return JSON.stringify({
-        inline_keyboard: [
-            [{ text: otp, callback_data: otp }, { text: "🎭 Owner", url: config.MSG_BOT.ADMIN_LINK }],
-            [{ text: "📞 Get Number", url: config.MSG_BOT.BOT_LINK }]
-        ]
-    });
-}
-
-async function sendTelegram(text, otp) {
-    if (!config.MSG_BOT.TOKEN || !config.MSG_BOT.CHAT_ID) return;
-    const payload = {
-        chat_id: config.MSG_BOT.CHAT_ID,
-        text,
-        parse_mode: 'HTML',
-        reply_markup: otp ? createInlineKeyboard(otp) : undefined
-    };
-    try {
-        const res = await fetch(`https://api.telegram.org/bot${config.MSG_BOT.TOKEN}/sendMessage`, {
-            method: 'POST', body: JSON.stringify(payload), headers: { 'Content-Type': 'application/json' }
-        });
-        if (!res.ok) console.log('❌ Telegram send failed:', await res.text());
-    } catch (e) { console.log('⚠️ Telegram error:', e.message); }
-}
-
-module.exports = async (browser) => {
-    const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+module.exports = async (context) => {
+    const bot = new TelegramBot(config.MSG_BOT.TOKEN, { polling: true });
     const page = await context.newPage();
-    console.log('[MSG-BOT] Tab initialized');
+    console.log('[MSG-BOT] Initializing Tab...');
 
-    while (true) {
+    // Cache untuk filter OTP baru
+    const otpCache = new Set();
+
+    const maskPhone = (phone) => {
+        if (!phone || phone === 'N/A') return phone;
+        const digits = phone.replace(/\D/g, '');
+        return phone.startsWith('+')
+            ? `+${digits.slice(0, 5)}***${digits.slice(-4)}`
+            : `${digits.slice(0, 5)}***${digits.slice(-4)}`;
+    };
+
+    const extractOTP = (text) => {
+        if (!text) return null;
+        const match = text.match(/(\d{4,8})/);
+        return match ? match[0] : null;
+    };
+
+    const formatMessage = (otpData) => {
+        const phoneMasked = maskPhone(otpData.phone);
+        return (
+            `💭 <b>New Message Received</b>\n\n` +
+            `<b>📱 Number:</b> <code>${phoneMasked}</code>\n` +
+            `<b>✅ Service:</b> <b>${otpData.service}</b>\n` +
+            `<b>FULL MESSAGE:</b>\n<blockquote>${otpData.full_message}</blockquote>\n` +
+            `<b>🔐 OTP:</b> <code>${otpData.otp}</code>`
+        );
+    };
+
+    const loopMonitor = async () => {
         try {
-            // --- Intercept Network API first ---
-            const response = await page.waitForResponse(resp => resp.url().includes('/getnum/info') && resp.status() === 200, { timeout: 5000 }).catch(() => null);
-            let messages = [];
+            if (page.url() !== config.URL_TARGET_MSG) {
+                await page.goto(config.URL_TARGET_MSG, { waitUntil: 'domcontentloaded' });
+            }
+
+            // --- API Intercept ---
+            const response = await page.waitForResponse(
+                r => r.url().includes('/getnum/info') && r.status() === 200,
+                { timeout: 5000 }
+            ).catch(() => null);
+
             if (response) {
-                const data = await response.json();
-                const numbers = data.data?.numbers || [];
+                const json = await response.json();
+                const numbers = json.data?.numbers || [];
+                const smcData = [];
+                const savedSMC = utils.loadJson(config.FILES.SMC, []);
+
                 for (const item of numbers) {
                     if (item.status === 'success' && item.message) {
-                        messages.push({
-                            otp: extractOTP(item.message),
-                            phone: '+' + item.number,
-                            service: item.full_number || 'Facebook',
-                            range: item.country || 'N/A',
-                            raw_message: item.message,
-                            username: item.username || null
-                        });
+                        const rawMsg = item.message;
+                        const otp = extractOTP(rawMsg) || 'N/A';
+                        const phone = "+" + item.number;
+                        const entry = {
+                            otp,
+                            phone,
+                            service: item.full_number || 'Service',
+                            full_message: rawMsg,
+                            timestamp: Date.now()
+                        };
+
+                        smcData.push(entry);
+
+                        const cacheKey = `${phone}_${otp}`;
+                        if (!otpCache.has(cacheKey)) {
+                            otpCache.add(cacheKey);
+                            // Kirim notif ke Telegram
+                            if (config.MSG_BOT.ADMIN_ID) {
+                                bot.sendMessage(
+                                    config.MSG_BOT.ADMIN_ID,
+                                    formatMessage(entry),
+                                    { parse_mode: 'HTML' }
+                                );
+                            }
+                        }
                     }
+                }
+
+                // Update smc.json jika ada perubahan
+                if (JSON.stringify(smcData) !== JSON.stringify(savedSMC)) {
+                    utils.saveJson(config.FILES.SMC, smcData);
                 }
             }
 
-            // --- Fallback Scraper ---
-            if (messages.length === 0) {
-                try {
-                    if (page.url() !== config.URL_TARGET_MSG) await page.goto(config.URL_TARGET_MSG, { waitUntil: 'domcontentloaded' });
-                    const scraped = await page.evaluate(() => {
-                        const rows = Array.from(document.querySelectorAll('tr'));
-                        return rows.map(r => r.innerText.trim()).filter(t => t);
-                    });
-                    for (const t of scraped) {
-                        const otp = extractOTP(t);
-                        if (otp) messages.push({ otp, phone: 'N/A', service: 'Unknown', range: 'N/A', raw_message: t, username: null });
-                    }
-                } catch {}
-            }
-
-            // --- Filter & Send New OTP ---
-            const newOTPs = otpFilter.filter(messages);
-            for (const otpData of newOTPs) {
-                saveOTPToJSON(otpData);
-                const msgText = formatOTPMessage(otpData);
-                await sendTelegram(msgText, otpData.otp);
-                console.log('📩 OTP sent:', otpData.otp);
+            // --- DOM fallback (klik refresh) ---
+            try {
+                await page.click('th:has-text("Number Info")', { timeout: 1000 });
+            } catch (e) {
+                await page.reload();
             }
         } catch (e) {
-            console.log('⚠️ MSG-BOT loop error:', e.message);
+            // Reload page if stuck
+            try { await page.reload(); } catch (err) {}
         }
-        await new Promise(r => setTimeout(r, 2000)); // loop delay
-    }
+
+        setTimeout(loopMonitor, 2000); // Loop 2 detik
+    };
+
+    // Jalankan loop monitor
+    loopMonitor();
+
+    // Telegram command
+    bot.onText(/\/status/, (msg) => {
+        bot.sendMessage(msg.chat.id, "🤖 <b>Message Bot Active</b>", { parse_mode: 'HTML' });
+    });
 };
