@@ -8,84 +8,86 @@ module.exports = async (context) => {
 
     console.log('[MSG-BOT] Initializing Tab...');
 
+    // Load cache SMS lama
+    let savedSMC = utils.loadJson(config.FILES.SMC, []);
+
     const loopMonitor = async () => {
         try {
-            // Pastikan URL benar
             if (page.url() !== config.URL_TARGET_MSG) {
-                await page.goto(config.URL_TARGET_MSG, { waitUntil: 'domcontentloaded' });
+                await page.goto(config.URL_TARGET_MSG, { waitUntil: 'domcontentloaded', timeout: 60000 });
             }
 
-            // Monitor Logic (Scraping SMS)
-            // Selector disesuaikan dengan script python (th:has-text("Number Info"))
-            // Kita coba fetch response JSON intercept seperti di python (lebih cepat)
-            
-            const response = await page.waitForResponse(response => 
-                response.url().includes('/getnum/info') && response.status() === 200
-            , { timeout: 5000 }).catch(() => null);
+            // 🔥 SCRAPE DATA SMS DARI HALAMAN
+            const numbers = await page.evaluate(() => {
+                const rows = document.querySelectorAll('tr'); // sesuaikan selector kalau beda
+                const data = [];
 
-            if (response) {
-                const json = await response.json();
-                const numbers = json.data?.numbers || [];
-                const smcData = []; // Data untuk disimpan ke smc.json
-                const savedSMC = utils.loadJson(config.FILES.SMC, []);
+                rows.forEach(row => {
+                    const text = row.innerText;
+                    if (!text) return;
 
-                for (const item of numbers) {
-                    if (item.status === 'success' && item.message) {
-                        const rawMsg = item.message;
-                        const otpMatch = rawMsg.match(/(\d{4,8})/); // Simple regex otp
-                        const otp = otpMatch ? otpMatch[0] : 'N/A';
-                        const phone = "+" + item.number;
-                        
-                        const entry = {
-                            otp: otp,
-                            phone: phone,
-                            service: item.full_number || "Service",
-                            full_message: rawMsg,
-                            timestamp: Date.now()
-                        };
+                    const otpMatch = text.match(/(\d{4,8})/);
+                    const phoneMatch = text.match(/\+\d+/);
 
-                        smcData.push(entry);
+                    if (otpMatch && phoneMatch) {
+                        data.push({
+                            otp: otpMatch[0],
+                            phone: phoneMatch[0],
+                            message: text
+                        });
+                    }
+                });
 
-                        // Logic Kirim ke Channel Message jika belum ada di cache
-                        // (Implementasi cache sederhana)
-                        const cacheKey = `${phone}_${otp}`;
-                        // Cek apakah pesan ini baru (logic sederhana, bisa diperbaiki dengan cache file)
-                        // Disini kita simpan ke smc.json untuk dibaca GetBot
+                return data;
+            });
+
+            const newData = [];
+
+            for (const item of numbers) {
+                const exists = savedSMC.find(x => x.phone === item.phone && x.otp === item.otp);
+
+                if (!exists) {
+                    const entry = {
+                        otp: item.otp,
+                        phone: item.phone,
+                        full_message: item.message,
+                        timestamp: Date.now()
+                    };
+
+                    savedSMC.push(entry);
+                    newData.push(entry);
+                }
+            }
+
+            // 🔥 Kalau ada SMS baru → simpan & kirim ke Telegram
+            if (newData.length > 0) {
+                utils.saveJson(config.FILES.SMC, savedSMC);
+
+                for (const sms of newData) {
+                    const text = `📩 <b>SMS Baru</b>\n\n📞 ${sms.phone}\n🔐 OTP: <code>${sms.otp}</code>`;
+                    
+                    if (config.MSG_BOT.CHAT_ID) {
+                        await bot.sendMessage(config.MSG_BOT.CHAT_ID, text, { parse_mode: 'HTML' });
                     }
                 }
-                
-                // Update smc.json untuk digunakan oleh GET BOT
-                // Bandingkan dengan data lama untuk deteksi SMS baru
-                if (JSON.stringify(smcData) !== JSON.stringify(savedSMC)) {
-                     utils.saveJson(config.FILES.SMC, smcData);
-                     // Disini juga bisa pasang logic kirim notif ke Channel Message Bot
-                     // jika diinginkan seperti di all.py
-                }
+
+                console.log(`[MSG-BOT] ${newData.length} SMS baru dikirim`);
             }
 
-            // Klik refresh atau tunggu update
-            // Di python dia klik th:has-text("Number Info")
-            try {
-                await page.click('th:has-text("Number Info")', { timeout: 1000 });
-            } catch (e) {
-                await page.reload();
-            }
+            // refresh halaman
+            await page.reload({ waitUntil: 'domcontentloaded' });
 
         } catch (e) {
-            // console.error('[MSG-BOT] Loop Warning:', e.message);
-            // Reload page if stuck
-            try { await page.reload(); } catch(err) {}
+            console.log('[MSG-BOT] Warning:', e.message);
+            try { await page.reload(); } catch {}
         }
-        
-        setTimeout(loopMonitor, 2000); // Loop delay
+
+        setTimeout(loopMonitor, 3000);
     };
 
-    // Jalankan Loop
     loopMonitor();
 
-    // Listener bot telegram (Command sederhana)
     bot.onText(/\/status/, (msg) => {
         bot.sendMessage(msg.chat.id, "🤖 <b>Message Bot Active</b>", { parse_mode: 'HTML' });
     });
 };
-
